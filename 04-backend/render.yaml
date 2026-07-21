@@ -1,0 +1,24 @@
+# Render Blueprint — one-click deploy of the Rhema Rides server.
+# Assumes these files sit at the repo ROOT (package.json next to server.js).
+# In Render: New + → Blueprint → connect the repo.
+services:
+  - type: web
+    name: rhema-notify
+    runtime: node
+    plan: free
+    buildCommand: npm install
+    startCommand: node server.js
+    healthCheckPath: /health
+    envVars:
+      - key: DRIVER_PHONE
+        sync: false
+      - key: DRIVER_EMAIL
+        sync: false
+      - key: EMAIL_FROM
+        sync: false
+      - key: TEXTBEE_API_KEY
+        sync: false
+      - key: TEXTBEE_DEVICE_ID
+        sync: false
+      - key: RESEND_API_KEY
+        sync: false

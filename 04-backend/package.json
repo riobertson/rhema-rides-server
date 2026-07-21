@@ -1,0 +1,13 @@
+{
+  "name": "rhema-rides-notify",
+  "version": "1.0.0",
+  "description": "Rhema Rides notification + AI phone line webhook server",
+  "main": "server.js",
+  "engines": { "node": ">=18" },
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.19.2"
+  }
+}
