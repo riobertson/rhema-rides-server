@@ -200,6 +200,13 @@ app.post('/api/vapi', async (req, res) => {
   try {
     const msg = (req.body && req.body.message) || {};
     const calls = msg.toolCallList || msg.toolCalls || [];
+
+    // Caller ID from the Vapi call, as a fallback when the AI didn't capture the phone.
+    const callerNumber =
+      (msg.call && msg.call.customer && msg.call.customer.number) ||
+      (msg.customer && msg.customer.number) ||
+      (msg.call && msg.call.from) || null;
+
     const results = [];
 
     for (const rawCall of calls) {
@@ -212,6 +219,9 @@ app.post('/api/vapi', async (req, res) => {
         result = 'The flat rate for a trip ' + range + ' is about $' + band.price +
                  '. Michael confirms the exact flat rate when he texts you back.';
       } else if (c.name === 'submit_ride_request') {
+        // Fall back to caller ID if the assistant didn't pass a phone number.
+        if (!c.args.phone && callerNumber) c.args.phone = callerNumber;
+        if (!c.args.name) c.args.name = 'Caller';
         const out = await handleRideRequest(c.args);
         result = 'Got it — request ' + out.id + ' has been sent to Michael. ' +
                  'He will text the caller shortly to confirm the ride' +
