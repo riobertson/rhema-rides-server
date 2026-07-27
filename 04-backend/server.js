@@ -42,19 +42,57 @@ const CONFIG = {
   textbeeKey:   process.env.TEXTBEE_API_KEY  || '',
   textbeeDevice:process.env.TEXTBEE_DEVICE_ID || '',
   resendKey:    process.env.RESEND_API_KEY || '',
+  // Twilio SMS (Option B) — if these are set, SMS goes through Twilio instead of textbee.
+  twilioSid:    process.env.TWILIO_ACCOUNT_SID || '',
+  twilioToken:  process.env.TWILIO_AUTH_TOKEN  || '',
+  twilioFrom:   process.env.TWILIO_FROM_NUMBER || '',
 };
 
-/* ---- send one SMS through textbee (free, driver's Android SIM) ---- */
+/* ---- send one SMS — Twilio if configured, otherwise textbee ----
+   Provider is chosen automatically:
+     • If TWILIO_* env vars are set  -> send via Twilio (business number, texts anyone incl. the driver)
+     • else if TEXTBEE_* are set     -> send via textbee (free, from the gateway phone's SIM)
+     • else                          -> skip gracefully (logged) */
 async function sendText(toPhone, message) {
-  if (!CONFIG.textbeeKey || !CONFIG.textbeeDevice) {
-    console.log('[SMS skipped — no textbee key] ->', toPhone, '::', message);
-    return;
+  if (CONFIG.twilioSid && CONFIG.twilioToken && CONFIG.twilioFrom) {
+    return sendTextTwilio(toPhone, message);
   }
-  await fetch(`https://api.textbee.dev/api/v1/gateway/devices/${CONFIG.textbeeDevice}/send-sms`, {
+  if (CONFIG.textbeeKey && CONFIG.textbeeDevice) {
+    return sendTextTextbee(toPhone, message);
+  }
+  console.log('[SMS skipped — no SMS provider configured] ->', toPhone, '::', message);
+}
+
+/* ---- Twilio SMS (from the business number; can text the driver too) ---- */
+async function sendTextTwilio(toPhone, message) {
+  const url = `https://api.twilio.com/2010-04-01/Accounts/${CONFIG.twilioSid}/Messages.json`;
+  const form = new URLSearchParams({ To: toPhone, From: CONFIG.twilioFrom, Body: message });
+  const auth = Buffer.from(`${CONFIG.twilioSid}:${CONFIG.twilioToken}`).toString('base64');
+  const resp = await fetch(url, {
+    method: 'POST',
+    headers: {
+      Authorization: 'Basic ' + auth,
+      'Content-Type': 'application/x-www-form-urlencoded',
+    },
+    body: form.toString(),
+  });
+  if (!resp.ok) {
+    const detail = await resp.text().catch(() => '');
+    console.error('[Twilio SMS failed]', resp.status, '->', toPhone, '::', detail);
+  }
+}
+
+/* ---- textbee SMS (free, sends from the gateway phone's Android SIM) ---- */
+async function sendTextTextbee(toPhone, message) {
+  const resp = await fetch(`https://api.textbee.dev/api/v1/gateway/devices/${CONFIG.textbeeDevice}/send-sms`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', 'x-api-key': CONFIG.textbeeKey },
     body: JSON.stringify({ recipients: [toPhone], message }),
   });
+  if (!resp.ok) {
+    const detail = await resp.text().catch(() => '');
+    console.error('[textbee SMS failed]', resp.status, '->', toPhone, '::', detail);
+  }
 }
 
 /* ---- send the driver email through Resend ---- */
@@ -219,10 +257,20 @@ app.post('/api/vapi', async (req, res) => {
         result = 'The flat rate for a trip ' + range + ' is about $' + band.price +
                  '. Michael confirms the exact flat rate when he texts you back.';
       } else if (c.name === 'submit_ride_request') {
-        // Fall back to caller ID if the assistant didn't pass a phone number.
-        if (!c.args.phone && callerNumber) c.args.phone = callerNumber;
-        if (!c.args.name) c.args.name = 'Caller';
-        const out = await handleRideRequest(c.args);
+        // Tolerate mis-labeled fields from the assistant (e.g. "Drop-off", "Passengers",
+        // "name.") by mapping common variants onto the keys the notifier expects.
+        const a = c.args;
+        a.name     = a.name     || a['name.'] || a.fullName || a.customer || '';
+        a.dropoff  = a.dropoff  || a['Drop-off'] || a.dropOff || a.destination || a.dropoff_location || '';
+        a.pickup   = a.pickup   || a.Pickup || a.pickup_location || '';
+        a.passengers = a.passengers || a.Passengers || '';
+
+        // Only trust a phone value that actually looks like a number; otherwise use caller ID.
+        const digits = String(a.phone || '').replace(/\D/g, '');
+        if (digits.length < 10) a.phone = callerNumber || '';
+        if (!a.name) a.name = 'Caller';
+
+        const out = await handleRideRequest(a);
         result = 'Got it — request ' + out.id + ' has been sent to Michael. ' +
                  'He will text the caller shortly to confirm the ride' +
                  (out.price ? (' and the flat rate, about $' + out.price + '.') : '.');
