@@ -34,6 +34,15 @@ const { quoteForMiles } = require('./pricing');
 const app = express();
 app.use(express.json());
 
+/* ---- allow the dashboard (hosted on a different domain) to call this API ---- */
+app.use((req, res, next) => {
+  res.header('Access-Control-Allow-Origin', '*');
+  res.header('Access-Control-Allow-Methods', 'GET,POST,OPTIONS');
+  res.header('Access-Control-Allow-Headers', 'Content-Type');
+  if (req.method === 'OPTIONS') return res.sendStatus(204);
+  next();
+});
+
 const CONFIG = {
   business:     'Rhema Rides',
   driverPhone:  process.env.DRIVER_PHONE  || '(469) 360-0916',
@@ -46,6 +55,10 @@ const CONFIG = {
   twilioSid:    process.env.TWILIO_ACCOUNT_SID || '',
   twilioToken:  process.env.TWILIO_AUTH_TOKEN  || '',
   twilioFrom:   process.env.TWILIO_FROM_NUMBER || '',
+  // Supabase (shared bookings database) — powers the cross-device dashboard.
+  supabaseUrl:  process.env.SUPABASE_URL || '',
+  supabaseKey:  process.env.SUPABASE_SERVICE_KEY || '',
+  dashToken:    process.env.DASHBOARD_TOKEN || '',
 };
 
 /* ---- send one SMS — Twilio if configured, otherwise textbee ----
@@ -115,6 +128,75 @@ function genId(prefix) {
 }
 
 /* ===========================================================
+   SUPABASE — shared bookings database (powers the dashboard)
+   Uses the REST (PostgREST) API with the service key. If the
+   keys aren't set, these no-op gracefully so the server still
+   runs and sends notifications.
+   =========================================================== */
+function supaHeaders() {
+  return {
+    'Content-Type': 'application/json',
+    apikey: CONFIG.supabaseKey,
+    Authorization: 'Bearer ' + CONFIG.supabaseKey,
+  };
+}
+
+// Save one booking/request into the rhema_bookings table.
+async function saveBooking(b, source) {
+  if (!CONFIG.supabaseUrl || !CONFIG.supabaseKey) {
+    console.log('[DB skipped — no Supabase key] ->', source, b.id || '');
+    return;
+  }
+  const row = {
+    ref:        b.id || null,
+    source:     source || 'website',
+    status:     'new',
+    name:       b.name || null,
+    phone:      b.phone || null,
+    email:      b.email || null,
+    pickup:     b.pickup || null,
+    dropoff:    b.dropoff || null,
+    when_text:  b.when || null,
+    passengers: (b.passengers != null ? String(b.passengers) : null),
+    miles:      (b.miles != null && b.miles !== '' ? Number(b.miles) : null),
+    price:      (b.price != null && b.price !== '' ? Number(b.price) : null),
+    notes:      b.notes || null,
+  };
+  try {
+    const resp = await fetch(CONFIG.supabaseUrl + '/rest/v1/rhema_bookings', {
+      method: 'POST',
+      headers: Object.assign(supaHeaders(), { Prefer: 'return=minimal' }),
+      body: JSON.stringify(row),
+    });
+    if (!resp.ok) console.error('[Supabase save failed]', resp.status, await resp.text().catch(() => ''));
+  } catch (err) {
+    console.error('[Supabase save error]', String(err));
+  }
+}
+
+// Read all bookings (newest first) for the dashboard.
+async function listBookings() {
+  if (!CONFIG.supabaseUrl || !CONFIG.supabaseKey) return [];
+  const url = CONFIG.supabaseUrl +
+    '/rest/v1/rhema_bookings?select=*&order=created_at.desc&limit=500';
+  const resp = await fetch(url, { headers: supaHeaders() });
+  if (!resp.ok) throw new Error('list failed ' + resp.status);
+  return resp.json();
+}
+
+// Update a booking's status by its database id.
+async function updateBookingStatus(id, status) {
+  if (!CONFIG.supabaseUrl || !CONFIG.supabaseKey) return;
+  const url = CONFIG.supabaseUrl + '/rest/v1/rhema_bookings?id=eq.' + encodeURIComponent(id);
+  const resp = await fetch(url, {
+    method: 'PATCH',
+    headers: Object.assign(supaHeaders(), { Prefer: 'return=minimal' }),
+    body: JSON.stringify({ status: status }),
+  });
+  if (!resp.ok) throw new Error('update failed ' + resp.status);
+}
+
+/* ===========================================================
    WEBSITE BOOKING (confirmed) — "you're booked ✓"
    =========================================================== */
 function buildMessages(b) {
@@ -150,6 +232,7 @@ app.post('/api/booking', async (req, res) => {
   try {
     const b = req.body || {};
     const m = buildMessages(b);
+    await saveBooking(b, 'website');
     await sendText(CONFIG.driverPhone, m.driverSms);
     await sendEmail(m.emailSubject, m.emailBody);
     if (b.phone) await sendText(b.phone, m.clientSms);
@@ -198,6 +281,7 @@ async function handleRideRequest(raw) {
   b.id = b.id || genId('R');
   if (!b.price && b.miles) b.price = quoteForMiles(b.miles).price; // estimate only
   const m = buildRequestMessages(b);
+  await saveBooking(b, 'phone');
   await sendText(CONFIG.driverPhone, m.driverSms);
   await sendEmail(m.emailSubject, m.emailBody);
   if (b.phone) await sendText(b.phone, m.clientSms);
@@ -285,6 +369,40 @@ app.post('/api/vapi', async (req, res) => {
   } catch (err) {
     console.error('vapi webhook failed:', err);
     res.status(500).json({ results: [{ toolCallId: '', result: 'Sorry, something went wrong saving that request.' }] });
+  }
+});
+
+/* ===========================================================
+   DASHBOARD DATA — the driver dashboard reads/writes here.
+   Protected by a shared token (?token=...).
+   =========================================================== */
+function tokenOk(req) {
+  if (!CONFIG.dashToken) return true; // no token configured = open
+  const t = (req.query && req.query.token) || (req.body && req.body.token) || '';
+  return t === CONFIG.dashToken;
+}
+
+app.get('/api/bookings', async (req, res) => {
+  if (!tokenOk(req)) return res.status(401).json({ ok: false, error: 'bad token' });
+  try {
+    const bookings = await listBookings();
+    res.json({ ok: true, bookings });
+  } catch (err) {
+    console.error('list bookings failed:', err);
+    res.status(500).json({ ok: false, error: String(err) });
+  }
+});
+
+app.post('/api/bookings/update', async (req, res) => {
+  if (!tokenOk(req)) return res.status(401).json({ ok: false, error: 'bad token' });
+  try {
+    const b = req.body || {};
+    if (!b.id || !b.status) return res.status(400).json({ ok: false, error: 'id and status required' });
+    await updateBookingStatus(b.id, b.status);
+    res.json({ ok: true });
+  } catch (err) {
+    console.error('update booking failed:', err);
+    res.status(500).json({ ok: false, error: String(err) });
   }
 });
 
