@@ -59,7 +59,74 @@ const CONFIG = {
   supabaseUrl:  process.env.SUPABASE_URL || '',
   supabaseKey:  process.env.SUPABASE_SERVICE_KEY || '',
   dashToken:    process.env.DASHBOARD_TOKEN || '',
+  // Square payments — authorize the card at booking, capture when the ride is completed.
+  // If SQUARE_ACCESS_TOKEN + SQUARE_LOCATION_ID are set, /api/pay-and-book takes payments.
+  squareToken:    process.env.SQUARE_ACCESS_TOKEN || '',
+  squareLocation: process.env.SQUARE_LOCATION_ID || '',
+  squareEnv:      (process.env.SQUARE_ENV || 'sandbox').toLowerCase(), // 'sandbox' | 'production'
 };
+
+/* ===========================================================
+   SQUARE — hold-then-capture payments
+   Flow: authorize (hold) the card when the rider books, then
+   capture (release to Michael) when he marks the ride complete.
+   Cancelling a ride voids the hold so the rider is never charged.
+   All calls no-op-safe: if keys aren't set, payments are skipped.
+   Auth holds last ~6 days; capture within that window.
+   =========================================================== */
+function squareOn() { return !!(CONFIG.squareToken && CONFIG.squareLocation); }
+function squareBase() {
+  return CONFIG.squareEnv === 'production'
+    ? 'https://connect.squareup.com'
+    : 'https://connect.squareupsandbox.com';
+}
+function squareHeaders() {
+  return {
+    'Content-Type': 'application/json',
+    'Square-Version': '2025-01-23',
+    Authorization: 'Bearer ' + CONFIG.squareToken,
+  };
+}
+
+// Authorize (hold) a card. sourceId = the token from the Web Payments SDK on the site.
+async function squareAuthorize(opts) {
+  const body = {
+    source_id: opts.sourceId,
+    idempotency_key: (opts.ref || 'ride') + '-' + Date.now(),
+    amount_money: { amount: opts.amountCents, currency: 'USD' },
+    autocomplete: false, // <-- hold, do NOT capture yet
+    location_id: CONFIG.squareLocation,
+    reference_id: opts.ref || undefined,
+    note: opts.note || undefined,
+  };
+  const resp = await fetch(squareBase() + '/v2/payments', {
+    method: 'POST', headers: squareHeaders(), body: JSON.stringify(body),
+  });
+  const data = await resp.json().catch(() => ({}));
+  if (!resp.ok) {
+    const msg = (data.errors && data.errors[0] && data.errors[0].detail) || ('square ' + resp.status);
+    return { ok: false, error: msg };
+  }
+  return { ok: true, paymentId: data.payment && data.payment.id, status: data.payment && data.payment.status };
+}
+
+// Capture a held payment (money moves to Michael). Call when the ride is completed.
+async function squareComplete(paymentId) {
+  const resp = await fetch(squareBase() + '/v2/payments/' + encodeURIComponent(paymentId) + '/complete', {
+    method: 'POST', headers: squareHeaders(), body: '{}',
+  });
+  if (!resp.ok) throw new Error('square capture failed ' + resp.status + ' ' + await resp.text().catch(() => ''));
+  return true;
+}
+
+// Void a held payment (rider is not charged). Call when a ride is declined/cancelled.
+async function squareCancel(paymentId) {
+  const resp = await fetch(squareBase() + '/v2/payments/' + encodeURIComponent(paymentId) + '/cancel', {
+    method: 'POST', headers: squareHeaders(), body: '{}',
+  });
+  if (!resp.ok) throw new Error('square void failed ' + resp.status + ' ' + await resp.text().catch(() => ''));
+  return true;
+}
 
 /* ---- send one SMS — Twilio if configured, otherwise textbee ----
    Provider is chosen automatically:
@@ -141,6 +208,52 @@ function supaHeaders() {
   };
 }
 
+// Estimate a ride's duration (minutes) from distance, matching the site's logic.
+function estimateDurationSrv(miles) {
+  var m = Number(miles);
+  if (!m || isNaN(m)) return 45;
+  return Math.max(15, Math.round(m * 2.5));
+}
+
+// Normalize a booking's "when" into an ISO timestamp (or null if unparseable).
+function whenToISO(when) {
+  if (!when) return null;
+  var t = Date.parse(when);
+  return isNaN(t) ? null : new Date(t).toISOString();
+}
+
+/* Returns a conflicting booking, or null. A slot is taken if any booking that
+   is NOT declined/cancelled overlaps the requested [start, start+duration).
+   Checks the SHARED database, so it catches bookings from any device or the
+   phone line — this is the authoritative overbooking guard. */
+async function findConflict(whenISO, durationMin, excludeRef) {
+  if (!CONFIG.supabaseUrl || !CONFIG.supabaseKey || !whenISO) return null;
+  var start = Date.parse(whenISO);
+  if (isNaN(start)) return null;
+  var end = start + (Number(durationMin) || 45) * 60000;
+  // Pull active bookings whose start is within a 6-hour window either side.
+  var lo = new Date(start - 6 * 3600000).toISOString();
+  var hi = new Date(start + 6 * 3600000).toISOString();
+  var url = CONFIG.supabaseUrl + '/rest/v1/rhema_bookings' +
+    '?select=ref,name,when_ts,duration_min,status' +
+    '&when_ts=gte.' + encodeURIComponent(lo) +
+    '&when_ts=lte.' + encodeURIComponent(hi) +
+    '&status=not.in.(Declined,Cancelled,declined,cancelled)';
+  var resp = await fetch(url, { headers: supaHeaders() });
+  if (!resp.ok) return null; // fail-open on read errors (don't block a booking on a glitch)
+  var rows = await resp.json().catch(function () { return []; });
+  for (var i = 0; i < rows.length; i++) {
+    var r = rows[i];
+    if (!r.when_ts) continue;
+    if (excludeRef && r.ref === excludeRef) continue;
+    var es = Date.parse(r.when_ts);
+    if (isNaN(es)) continue;
+    var ee = es + (Number(r.duration_min) || 45) * 60000;
+    if (start < ee && es < end) return r; // overlap
+  }
+  return null;
+}
+
 // Save one booking/request into the rhema_bookings table.
 async function saveBooking(b, source) {
   if (!CONFIG.supabaseUrl || !CONFIG.supabaseKey) {
@@ -161,6 +274,11 @@ async function saveBooking(b, source) {
     miles:      (b.miles != null && b.miles !== '' ? Number(b.miles) : null),
     price:      (b.price != null && b.price !== '' ? Number(b.price) : null),
     notes:      b.notes || null,
+    payment_status: b.paymentStatus || null,
+    payment_id:     b.paymentId || null,
+    amount_cents:   (b.amountCents != null && b.amountCents !== '' ? Number(b.amountCents) : null),
+    when_ts:        whenToISO(b.when),
+    duration_min:   (b.durationMin != null && b.durationMin !== '' ? Number(b.durationMin) : estimateDurationSrv(b.miles)),
   };
   try {
     const resp = await fetch(CONFIG.supabaseUrl + '/rest/v1/rhema_bookings', {
@@ -182,6 +300,29 @@ async function listBookings() {
   const resp = await fetch(url, { headers: supaHeaders() });
   if (!resp.ok) throw new Error('list failed ' + resp.status);
   return resp.json();
+}
+
+// Fetch one booking row by its database id (for capture/void on status change).
+async function getBooking(id) {
+  if (!CONFIG.supabaseUrl || !CONFIG.supabaseKey) return null;
+  const url = CONFIG.supabaseUrl + '/rest/v1/rhema_bookings?id=eq.' +
+    encodeURIComponent(id) + '&select=*&limit=1';
+  const resp = await fetch(url, { headers: supaHeaders() });
+  if (!resp.ok) return null;
+  const rows = await resp.json().catch(() => []);
+  return rows[0] || null;
+}
+
+// Patch arbitrary fields on a booking by id (status, payment_status, etc.).
+async function patchBooking(id, fields) {
+  if (!CONFIG.supabaseUrl || !CONFIG.supabaseKey) return;
+  const url = CONFIG.supabaseUrl + '/rest/v1/rhema_bookings?id=eq.' + encodeURIComponent(id);
+  const resp = await fetch(url, {
+    method: 'PATCH',
+    headers: Object.assign(supaHeaders(), { Prefer: 'return=minimal' }),
+    body: JSON.stringify(fields),
+  });
+  if (!resp.ok) throw new Error('patch failed ' + resp.status);
 }
 
 // Update a booking's status by its database id.
@@ -231,6 +372,13 @@ function buildMessages(b) {
 app.post('/api/booking', async (req, res) => {
   try {
     const b = req.body || {};
+    // Overbooking guard: reject if the slot is already taken (any device / phone).
+    const whenISO = whenToISO(b.when);
+    if (whenISO) {
+      const dur = (b.durationMin != null && b.durationMin !== '') ? Number(b.durationMin) : estimateDurationSrv(b.miles);
+      const clash = await findConflict(whenISO, dur, b.id);
+      if (clash) return res.status(409).json({ ok: false, error: 'That time slot was just booked. Please pick another time.' });
+    }
     const m = buildMessages(b);
     await saveBooking(b, 'website');
     await sendText(CONFIG.driverPhone, m.driverSms);
@@ -239,6 +387,53 @@ app.post('/api/booking', async (req, res) => {
     res.json({ ok: true, id: b.id });
   } catch (err) {
     console.error('booking notify failed:', err);
+    res.status(500).json({ ok: false, error: String(err) });
+  }
+});
+
+/* ===========================================================
+   PAY + BOOK (Square) — rider pays upfront; card is HELD.
+   Body: { ...booking fields, sourceId, amountCents }
+   1) authorize (hold) the card via Square
+   2) if the hold succeeds, save the booking + notify the driver
+   3) money is captured later, when the ride is marked complete
+   =========================================================== */
+app.post('/api/pay-and-book', async (req, res) => {
+  try {
+    const b = req.body || {};
+    const sourceId = b.sourceId;
+    const amountCents = Number(b.amountCents || 0);
+    if (!squareOn()) return res.status(503).json({ ok: false, error: 'payments not configured' });
+    if (!sourceId || !amountCents) return res.status(400).json({ ok: false, error: 'card and amount required' });
+
+    // Overbooking guard runs BEFORE the card is charged, so a taken slot never bills the rider.
+    const whenISO = whenToISO(b.when);
+    if (whenISO) {
+      const dur = (b.durationMin != null && b.durationMin !== '') ? Number(b.durationMin) : estimateDurationSrv(b.miles);
+      const clash = await findConflict(whenISO, dur, b.id);
+      if (clash) return res.status(409).json({ ok: false, error: 'That time slot was just booked. Please pick another time. Your card was not charged.' });
+    }
+
+    const auth = await squareAuthorize({
+      sourceId: sourceId,
+      amountCents: amountCents,
+      ref: b.id || 'ride',
+      note: CONFIG.business + ' ride ' + (b.id || '') + ' — ' + (b.pickup || '?') + ' to ' + (b.dropoff || '?'),
+    });
+    if (!auth.ok) return res.status(402).json({ ok: false, error: auth.error || 'card was declined' });
+
+    // Payment is held — record it on the booking and alert the driver.
+    b.paymentId = auth.paymentId;
+    b.paymentStatus = 'authorized';
+    b.amountCents = amountCents;
+    const m = buildMessages(b);
+    await saveBooking(b, b.source ? String(b.source).toLowerCase() : 'website');
+    await sendText(CONFIG.driverPhone, 'PAID (held): ' + m.driverSms);
+    await sendEmail('PAID · ' + m.emailSubject, 'Payment is held on the rider\'s card and will be captured when you complete the ride.\n\n' + m.emailBody);
+    if (b.phone) await sendText(b.phone, m.clientSms + ' Your card is held and only charged once your ride is completed.');
+    res.json({ ok: true, id: b.id, paymentId: auth.paymentId });
+  } catch (err) {
+    console.error('pay-and-book failed:', err);
     res.status(500).json({ ok: false, error: String(err) });
   }
 });
@@ -398,8 +593,28 @@ app.post('/api/bookings/update', async (req, res) => {
   try {
     const b = req.body || {};
     if (!b.id || !b.status) return res.status(400).json({ ok: false, error: 'id and status required' });
+
+    // If this booking has a held Square payment, capture or void it on status change.
+    let payMsg = null;
+    if (squareOn()) {
+      const row = await getBooking(b.id);
+      const pid = row && row.payment_id;
+      const pstat = row && row.payment_status;
+      if (pid && pstat === 'authorized') {
+        if (b.status === 'Completed') {
+          await squareComplete(pid);
+          await patchBooking(b.id, { payment_status: 'captured' });
+          payMsg = 'captured';
+        } else if (b.status === 'Declined' || b.status === 'Cancelled') {
+          await squareCancel(pid);
+          await patchBooking(b.id, { payment_status: 'voided' });
+          payMsg = 'voided';
+        }
+      }
+    }
+
     await updateBookingStatus(b.id, b.status);
-    res.json({ ok: true });
+    res.json({ ok: true, payment: payMsg });
   } catch (err) {
     console.error('update booking failed:', err);
     res.status(500).json({ ok: false, error: String(err) });
