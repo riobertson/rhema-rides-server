@@ -254,6 +254,49 @@ async function findConflict(whenISO, durationMin, excludeRef) {
   return null;
 }
 
+/* ===========================================================
+   DRIVER TIME BLOCKS (rhema_blocks) — the driver marks ranges
+   (a day, or weeks at a time) as unavailable. Bookings that fall
+   inside a block are rejected, same as a booking conflict.
+   =========================================================== */
+async function listBlocksSrv() {
+  if (!CONFIG.supabaseUrl || !CONFIG.supabaseKey) return [];
+  const url = CONFIG.supabaseUrl + '/rest/v1/rhema_blocks?select=*&order=start_ts.asc';
+  const resp = await fetch(url, { headers: supaHeaders() });
+  if (!resp.ok) return [];
+  return resp.json().catch(function () { return []; });
+}
+async function addBlockSrv(b) {
+  const url = CONFIG.supabaseUrl + '/rest/v1/rhema_blocks';
+  const resp = await fetch(url, {
+    method: 'POST',
+    headers: Object.assign(supaHeaders(), { Prefer: 'return=representation' }),
+    body: JSON.stringify({ start_ts: b.start_ts, end_ts: b.end_ts, reason: b.reason || null }),
+  });
+  if (!resp.ok) throw new Error('block save failed ' + resp.status);
+  const rows = await resp.json().catch(function () { return []; });
+  return rows[0] || null;
+}
+async function deleteBlockSrv(id) {
+  const url = CONFIG.supabaseUrl + '/rest/v1/rhema_blocks?id=eq.' + encodeURIComponent(id);
+  const resp = await fetch(url, { method: 'DELETE', headers: Object.assign(supaHeaders(), { Prefer: 'return=minimal' }) });
+  if (!resp.ok) throw new Error('block delete failed ' + resp.status);
+}
+// Returns a blocking range that overlaps the requested time, or null.
+async function findBlock(whenISO, durationMin) {
+  if (!CONFIG.supabaseUrl || !CONFIG.supabaseKey || !whenISO) return null;
+  const start = Date.parse(whenISO);
+  if (isNaN(start)) return null;
+  const end = start + (Number(durationMin) || 45) * 60000;
+  const rows = await listBlocksSrv(); // blocks are few; fetch all and check overlap
+  for (let i = 0; i < rows.length; i++) {
+    const bs = Date.parse(rows[i].start_ts), be = Date.parse(rows[i].end_ts);
+    if (isNaN(bs) || isNaN(be)) continue;
+    if (start < be && bs < end) return rows[i];
+  }
+  return null;
+}
+
 // Save one booking/request into the rhema_bookings table.
 async function saveBooking(b, source) {
   if (!CONFIG.supabaseUrl || !CONFIG.supabaseKey) {
@@ -378,6 +421,8 @@ app.post('/api/booking', async (req, res) => {
       const dur = (b.durationMin != null && b.durationMin !== '') ? Number(b.durationMin) : estimateDurationSrv(b.miles);
       const clash = await findConflict(whenISO, dur, b.id);
       if (clash) return res.status(409).json({ ok: false, error: 'That time slot was just booked. Please pick another time.' });
+      const blocked = await findBlock(whenISO, dur);
+      if (blocked) return res.status(409).json({ ok: false, error: 'The driver is unavailable at that time. Please pick another time.' });
     }
     const m = buildMessages(b);
     await saveBooking(b, 'website');
@@ -412,6 +457,8 @@ app.post('/api/pay-and-book', async (req, res) => {
       const dur = (b.durationMin != null && b.durationMin !== '') ? Number(b.durationMin) : estimateDurationSrv(b.miles);
       const clash = await findConflict(whenISO, dur, b.id);
       if (clash) return res.status(409).json({ ok: false, error: 'That time slot was just booked. Please pick another time. Your card was not charged.' });
+      const blocked = await findBlock(whenISO, dur);
+      if (blocked) return res.status(409).json({ ok: false, error: 'The driver is unavailable at that time. Please pick another time. Your card was not charged.' });
     }
 
     const auth = await squareAuthorize({
@@ -617,6 +664,44 @@ app.post('/api/bookings/update', async (req, res) => {
     res.json({ ok: true, payment: payMsg });
   } catch (err) {
     console.error('update booking failed:', err);
+    res.status(500).json({ ok: false, error: String(err) });
+  }
+});
+
+/* Driver time blocks (token-gated, used by the dashboard) */
+app.get('/api/blocks', async (req, res) => {
+  if (!tokenOk(req)) return res.status(401).json({ ok: false, error: 'bad token' });
+  try {
+    const blocks = await listBlocksSrv();
+    res.json({ ok: true, blocks });
+  } catch (err) {
+    console.error('list blocks failed:', err);
+    res.status(500).json({ ok: false, error: String(err) });
+  }
+});
+
+app.post('/api/blocks', async (req, res) => {
+  if (!tokenOk(req)) return res.status(401).json({ ok: false, error: 'bad token' });
+  try {
+    const b = req.body || {};
+    if (!b.start_ts || !b.end_ts) return res.status(400).json({ ok: false, error: 'start_ts and end_ts required' });
+    const row = await addBlockSrv(b);
+    res.json({ ok: true, block: row });
+  } catch (err) {
+    console.error('add block failed:', err);
+    res.status(500).json({ ok: false, error: String(err) });
+  }
+});
+
+app.post('/api/blocks/delete', async (req, res) => {
+  if (!tokenOk(req)) return res.status(401).json({ ok: false, error: 'bad token' });
+  try {
+    const b = req.body || {};
+    if (!b.id) return res.status(400).json({ ok: false, error: 'id required' });
+    await deleteBlockSrv(b.id);
+    res.json({ ok: true });
+  } catch (err) {
+    console.error('delete block failed:', err);
     res.status(500).json({ ok: false, error: String(err) });
   }
 });
